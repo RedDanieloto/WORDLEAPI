@@ -10,7 +10,7 @@ Route::post('/register', [UsuarioController::class, 'sendVerification']);
 Route::post('/verify', [UsuarioController::class, 'verifyCode']);
 Route::post('/login', [UsuarioController::class, 'login']);
 
-// Rutas protegidas por Sanctum
+// Rutas protegidas
 Route::middleware('auth:sanctum')->group(function () {
     Route::post('/logout', [UsuarioController::class, 'logout']);
     Route::post('/juego', [GameController::class, 'create']);
@@ -21,6 +21,7 @@ Route::middleware('auth:sanctum')->group(function () {
     
     // Rutas de administrador
     Route::get('/admin/games', [AdminController::class, 'index']);
+    Route::post('/admin/activate', [AdminController::class, 'activateUser']); 
     Route::post('/admin/desactivate', [AdminController::class, 'deactivate']);
     Route::post('/admin/promote', [AdminController::class, 'promoteToAdmin']);
 });
