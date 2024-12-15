@@ -24,10 +24,9 @@ class GameController extends Controller
     {
         $user = Auth::user();
 
-        $palabra = "Secreto de Estado";
+        $palabra = null;
         $intentos = 5;
 
-        // Obtener palabra válida desde la API externa
         while ($intentos > 0) {
             $response = Http::get('https://clientes.api.greenborn.com.ar/public-random-word');
             if ($response->successful()) {
@@ -47,7 +46,7 @@ class GameController extends Controller
         $game = Game::create([
             'user_id' => $user->id,
             'word' => $palabra,
-            'remaining_attempts' => env('WORDLE_MAX_ATTEMPTS'),
+            'remaining_attempts' => env('WORDLE_MAX_ATTEMPTS', 5),
             'is_active' => false,
             'status' => 'por empezar',
         ]);
@@ -58,8 +57,8 @@ class GameController extends Controller
                 'id' => $game->id,
                 'status' => $game->status,
                 'word_length' => strlen($palabra),
-                'intentos_restantes' => env('WORDLE_MAX_ATTEMPTS'),
-                'creado_por' => $user->id,
+                'intentos_restantes' => env('WORDLE_MAX_ATTEMPTS', 5),
+                'creado_por' => $user,
             ],
         ], 201);
     }
@@ -81,6 +80,20 @@ class GameController extends Controller
         }
 
         return response()->json(['partidas_disponibles' => $games], 200);
+    }
+
+    // Función para ocultar la palabra y mostrar solo su longitud
+    private function maskWordIfActive($game)
+    {
+        // Calcular la longitud de la palabra ANTES de ocultarla
+        $game->word_length = strlen($game->word);
+    
+        // Ocultar la palabra si la partida está en progreso o por empezar
+        if (in_array($game->status, ['en progreso', 'por empezar'])) {
+            unset($game->word);
+        }
+    
+        return $game;
     }
 
     // Unirse a una partida
@@ -120,6 +133,30 @@ class GameController extends Controller
         ], 200);
     }
 
+    // Abandonar la partida
+    public function abandon()
+    {
+        $user = Auth::user();
+
+        $activeGame = Game::where('active_player_id', $user->id)
+            ->where('is_active', true)
+            ->first();
+
+        if (!$activeGame) {
+            return response()->json(['mensaje' => 'No tienes ninguna partida activa.'], 404);
+        }
+
+        $activeGame->update([
+            'is_active' => false,
+            'status' => 'abandonada',
+        ]);
+
+        $this->sendSlackSummary($activeGame, 'Abandonada');
+        $this->sendTwilioMessage($user->phone, "Has abandonado la partida. La palabra era: {$activeGame->word}");
+
+        return response()->json(['mensaje' => 'Has abandonado la partida.'], 200);
+    }
+
     // Historial de partidas
     public function history()
     {
@@ -154,26 +191,6 @@ class GameController extends Controller
         return response()->json(['partida_actual' => $this->maskWordIfActive($game)], 200);
     }
 
-    public function abandon()
-    {
-        $user = Auth::user();
-
-        $game = Game::where('active_player_id', $user->id)
-            ->where('is_active', true)
-            ->first();
-
-        if (!$game) {
-            return response()->json(['mensaje' => 'No tienes ninguna partida activa.'], 404);
-        }
-
-        $game->update(['is_active' => false, 'status' => 'abandonada']);
-
-        $this->sendSlackSummary($game, 'Abandonada');
-        $this->sendTwilioMessage($user->phone, "Has abandonado la partida.");
-        return response()->json(['mensaje' => 'Has abandonado la partida.'], 200);
-    }
-
-
     // Adivinar palabra
     public function guess(Request $request)
     {
@@ -205,8 +222,8 @@ class GameController extends Controller
 
         if ($attempt === $correctWord) {
             $game->update(['is_active' => false, 'status' => 'ganada']);
-            $this->sendTwilioMessage($user->phone, "¡Felicidades! Has ganado. La palabra era: $correctWord.");
             $this->sendSlackSummary($game, 'Ganada');
+            $this->sendTwilioMessage($user->phone, "¡Felicidades! Has ganado. La palabra era: $correctWord.");
             return response()->json(['mensaje' => '¡Felicidades! Has ganado.'], 200);
         }
 
@@ -214,21 +231,13 @@ class GameController extends Controller
 
         if ($game->remaining_attempts <= 0) {
             $game->update(['is_active' => false, 'status' => 'perdida']);
-            $this->sendTwilioMessage($user->phone, "Has perdido. La palabra era: $correctWord.");
             $this->sendSlackSummary($game, 'Perdida');
+            $this->sendTwilioMessage($user->phone, "Has perdido. La palabra era: $correctWord.");
             return response()->json(['mensaje' => 'Has perdido. La palabra era: ' . $correctWord], 200);
         }
 
         $this->sendTwilioMessage($user->phone, "Intento: $attempt | Pistas: $pistas | Intentos restantes: {$game->remaining_attempts}.");
         return response()->json(['pistas' => $pistas], 200);
-    }
-
-    private function maskWordIfActive($game)
-    {
-        if (in_array($game->status, ['en progreso', 'por empezar'])) {
-            $game->word = "Secreto de Estado";
-        }
-        return $game;
     }
 
     private function sendSlackSummary($game, $estado)
@@ -243,5 +252,4 @@ class GameController extends Controller
             'body' => $message,
         ]);
     }
-    
 }
