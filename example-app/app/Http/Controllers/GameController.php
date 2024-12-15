@@ -20,26 +20,14 @@ class GameController extends Controller
     }
 
     // Crear una nueva partida
-    public function create(Request $request)
+    public function create()
     {
-        $user = Auth::user(); // Usuario autenticado
+        $user = Auth::user();
 
-        $data = $request->validate([
-            'user_id' => 'required|exists:users,id',
-        ], [
-            'user_id.required' => 'El campo user_id es obligatorio.',
-            'user_id.exists' => 'El ID proporcionado no existe en la base de datos. Tu ID es ' . $user->id,
-        ]);
-
-        if ($user->id !== $data['user_id']) {
-            return response()->json([
-                'mensaje' => 'El ID proporcionado es incorrecto. Tu ID es ' . $user->id,
-            ], 403);
-        }
-
-        $palabra = null;
+        $palabra = "Secreto de Estado";
         $intentos = 5;
 
+        // Obtener palabra válida desde la API externa
         while ($intentos > 0) {
             $response = Http::get('https://clientes.api.greenborn.com.ar/public-random-word');
             if ($response->successful()) {
@@ -53,241 +41,207 @@ class GameController extends Controller
         }
 
         if (!$palabra) {
-            return response()->json(['mensaje' => 'No se pudo obtener una palabra válida después de varios intentos.'], 500);
-        }
-
-        $existingGame = Game::where('user_id', $user->id)->where('is_active', true)->first();
-        if ($existingGame) {
-            return response()->json(['mensaje' => 'Ya tienes una partida activa.'], 400);
+            return response()->json(['mensaje' => 'No se pudo obtener una palabra válida.'], 500);
         }
 
         $game = Game::create([
             'user_id' => $user->id,
             'word' => $palabra,
-            'remaining_attempts' => env('WORDLE_MAX_ATTEMPTS', 5),
+            'remaining_attempts' => env('WORDLE_MAX_ATTEMPTS'),
+            'is_active' => false,
+            'status' => 'por empezar',
         ]);
-
-        try {
-            $this->twilio->messages->create(
-                "whatsapp:" . $user->phone,
-                [
-                    'from' => 'whatsapp:' . env('TWILIO_WHATSAPP_NUMBER'),
-                    'body' => "Su partida se ha creado correctamente. La palabra a jugar tiene " . strlen($palabra) . " letras.",
-                ]
-            );
-        } catch (\Exception $e) {
-            return response()->json(['mensaje' => 'Error al enviar mensaje de WhatsApp: ' . $e->getMessage()], 500);
-        }
 
         return response()->json([
-            'mensaje' => 'Su partida se ha creado correctamente. La palabra a jugar tiene ' . strlen($palabra) . ' letras.',
-            'juego' => [
+            'mensaje' => 'Partida creada correctamente.',
+            'partida' => [
                 'id' => $game->id,
-                'user_id' => $game->user_id,
-                'intentos_restantes' => $game->remaining_attempts,
-                'creado_en' => $game->created_at,
-                'actualizado_en' => $game->updated_at,
+                'status' => $game->status,
+                'word_length' => strlen($palabra),
+                'intentos_restantes' => env('WORDLE_MAX_ATTEMPTS'),
+                'creado_por' => $user->id,
             ],
-        ]);
+        ], 201);
     }
 
-    // Enviar un intento de palabra
-    public function guess(Request $request)
+    // Consultar partidas disponibles
+    public function availableGames()
+    {
+        $user = Auth::user();
+
+        $games = Game::where('user_id', $user->id)
+            ->where('status', 'por empezar')
+            ->get()
+            ->map(function ($game) {
+                return $this->maskWordIfActive($game);
+            });
+
+        if ($games->isEmpty()) {
+            return response()->json(['mensaje' => 'No hay partidas disponibles.'], 404);
+        }
+
+        return response()->json(['partidas_disponibles' => $games], 200);
+    }
+
+    // Unirse a una partida
+    public function join(Request $request)
     {
         $user = Auth::user();
 
         $data = $request->validate([
             'game_id' => 'required|exists:games,id',
-            'word' => ['required', 'string', 'regex:/^[a-zA-Z]+$/'], // Validar solo letras
-        ], [
-            'game_id.required' => 'El campo game_id es obligatorio.',
-            'game_id.exists' => 'El juego especificado no existe.',
-            'word.required' => 'El campo palabra es obligatorio.',
-            'word.regex' => 'La palabra solo puede contener letras.',
         ]);
 
-        $game = Game::find($data['game_id']);
+        $activeGame = Game::where('active_player_id', $user->id)
+            ->where('is_active', true)
+            ->first();
 
-        if (!$game || !$game->is_active) {
-            $activeGame = Game::where('user_id', $user->id)->where('is_active', true)->first();
-            $mensaje = $activeGame
-                ? [
-                    'mensaje' => 'El ID de la partida que querías no existe o ya ha acabado.',
-                    'partida_activa' => [
-                        'id' => $activeGame->id,
-                        'creada_en' => $activeGame->created_at,
-                        'intentos_restantes' => $activeGame->remaining_attempts,
-                    ],
-                ]
-                : ['mensaje' => 'No tienes partidas activas.'];
-
-            return response()->json($mensaje, 404);
+        if ($activeGame) {
+            return response()->json([
+                'mensaje' => 'Ya tienes una partida activa.',
+                'partida_activa' => $this->maskWordIfActive($activeGame),
+            ], 400);
         }
 
-        if ($game->user_id !== $user->id) {
-            return response()->json(['mensaje' => 'No tienes permiso para realizar esta acción.'], 403);
-        }
-
-        $attempt = $data['word'];
-        $correctWord = $game->word;
-
-        if (strlen($attempt) !== strlen($correctWord)) {
-            return response()->json(['mensaje' => 'La palabra debe tener exactamente ' . strlen($correctWord) . ' caracteres.'], 400);
-        }
-
-        $pistas = '';
-        for ($i = 0; $i < strlen($correctWord); $i++) {
-            $pistas .= (isset($attempt[$i]) && $attempt[$i] === $correctWord[$i]) ? $correctWord[$i] : '-';
-        }
-
-        $game->attempts()->create([
-            'word' => $attempt,
-            'is_correct' => $attempt === $correctWord,
-        ]);
-
-        if ($attempt === $correctWord) {
-            $game->update(['is_active' => false]);
-            SendGameSummaryToSlack::dispatch($game, 'Ganado')->delay(now()->addMinute());
-
-            try {
-                $this->twilio->messages->create(
-                    "whatsapp:" . $user->phone,
-                    [
-                        'from' => 'whatsapp:' . env('TWILIO_WHATSAPP_NUMBER'),
-                        'body' => "¡Felicidades! Has ganado la partida. La palabra era: $correctWord.",
-                    ]
-                );
-            } catch (\Exception $e) {
-                return response()->json(['mensaje' => 'Error al enviar mensaje de WhatsApp: ' . $e->getMessage()], 500);
-            }
-
-            return response()->json(['mensaje' => '¡Correcto! Ganaste el juego.']);
-        }
-
-        $game->decrement('remaining_attempts');
-
-        if ($game->remaining_attempts <= 0) {
-            $game->update(['is_active' => false]);
-            SendGameSummaryToSlack::dispatch($game, 'Perdido')->delay(now()->addMinute());
-
-            try {
-                $this->twilio->messages->create(
-                    "whatsapp:" . $user->phone,
-                    [
-                        'from' => 'whatsapp:' . env('TWILIO_WHATSAPP_NUMBER'),
-                        'body' => "Has perdido la partida. La palabra correcta era: $correctWord.",
-                    ]
-                );
-            } catch (\Exception $e) {
-                return response()->json(['mensaje' => 'Error al enviar mensaje de WhatsApp: ' . $e->getMessage()], 500);
-            }
-
-            return response()->json(['mensaje' => 'Has perdido el juego. La palabra era: ' . $correctWord]);
-        }
-
-        try {
-            $this->twilio->messages->create(
-                "whatsapp:" . $user->phone,
-                [
-                    'from' => 'whatsapp:' . env('TWILIO_WHATSAPP_NUMBER'),
-                    'body' => "Intento: $attempt | Pistas: $pistas. Intentos restantes: {$game->remaining_attempts}.",
-                ]
-            );
-        } catch (\Exception $e) {
-            return response()->json(['mensaje' => 'Error al enviar mensaje de WhatsApp: ' . $e->getMessage()], 500);
-        }
-
-        return response()->json(['mensaje' => 'Intenta de nuevo.', 'intentos_restantes' => $game->remaining_attempts]);
-    }
-
-    // Abandonar la partida actual
-    public function abandon(Request $request)
-    {
-        $user = Auth::user();
-
-        $game = Game::where('user_id', $user->id)->where('is_active', true)->first();
+        $game = Game::where('id', $data['game_id'])
+            ->where('user_id', $user->id)
+            ->where('status', 'por empezar')
+            ->first();
 
         if (!$game) {
-            return response()->json(['mensaje' => 'No tienes ninguna partida activa para abandonar.'], 404);
+            return response()->json(['mensaje' => 'No puedes unirte a esta partida porque no te pertenece o no está disponible.'], 403);
         }
 
-        $game->update(['is_active' => false]);
-        $game->attempts()->create(['word' => 'abandonado', 'is_correct' => false]);
+        $game->update(['active_player_id' => $user->id, 'status' => 'en progreso', 'is_active' => true]);
 
-        SendGameSummaryToSlack::dispatch($game, 'Abandonado')->delay(now()->addMinute());
-
-        try {
-            $this->twilio->messages->create(
-                "whatsapp:" . $user->phone,
-                [
-                    'from' => 'whatsapp:' . env('TWILIO_WHATSAPP_NUMBER'),
-                    'body' => "Has abandonado la partida. La palabra correcta era: {$game->word}.",
-                ]
-            );
-        } catch (\Exception $e) {
-            return response()->json(['mensaje' => 'Error al enviar mensaje de WhatsApp: ' . $e->getMessage()], 500);
-        }
-
-        return response()->json(['mensaje' => 'Has abandonado la partida.']);
+        return response()->json([
+            'mensaje' => 'Te has unido correctamente a la partida.',
+            'partida' => $this->maskWordIfActive($game),
+        ], 200);
     }
 
-    // Consultar la partida actual
-    public function current(Request $request)
+    // Historial de partidas
+    public function history()
     {
         $user = Auth::user();
 
-        $game = Game::where('user_id', $user->id)
+        $games = Game::where('user_id', $user->id)
+            ->get()
+            ->map(function ($game) {
+                return $this->maskWordIfActive($game);
+            });
+
+        if ($games->isEmpty()) {
+            return response()->json(['mensaje' => 'No tienes partidas registradas.'], 404);
+        }
+
+        return response()->json(['historial' => $games], 200);
+    }
+
+    // Partida actual
+    public function current()
+    {
+        $user = Auth::user();
+
+        $game = Game::where('active_player_id', $user->id)
             ->where('is_active', true)
-            ->with(['attempts' => function ($query) {
-                $query->select('id', 'game_id', 'word', 'is_correct', 'created_at');
-            }])
             ->first();
 
         if (!$game) {
             return response()->json(['mensaje' => 'No tienes ninguna partida activa.'], 404);
         }
 
-        $attemptsWithHints = $game->attempts->map(function ($attempt) use ($game) {
-            $correctWord = $game->word;
-            $attemptWord = $attempt->word;
-            $hints = '';
-            for ($i = 0; $i < strlen($correctWord); $i++) {
-                $hints .= (isset($attemptWord[$i]) && $attemptWord[$i] === $correctWord[$i]) ? $correctWord[$i] : '-';
-            }
-            return [
-                'intento' => $attemptWord,
-                'pistas' => $hints,
-                'es_correcto' => $attempt->is_correct,
-                'creado_en' => $attempt->created_at,
-            ];
-        });
-
-        $response = [
-            'id' => $game->id,
-            'user_id' => $game->user_id,
-            'intentos_restantes' => $game->remaining_attempts,
-            'activo' => $game->is_active,
-            'intentos' => $attemptsWithHints,
-            'creado_en' => $game->created_at,
-            'actualizado_en' => $game->updated_at,
-        ];
-
-        return response()->json(['juego' => $response]);
+        return response()->json(['partida_actual' => $this->maskWordIfActive($game)], 200);
     }
 
-    // Consultar el historial de juegos
-    public function history(Request $request)
+    public function abandon()
     {
         $user = Auth::user();
 
-        $games = Game::where('user_id', $user->id)
-            ->with('attempts')
-            ->get();
+        $game = Game::where('active_player_id', $user->id)
+            ->where('is_active', true)
+            ->first();
 
-        if ($games->isEmpty()) {
-            return response()->json(['mensaje' => 'No tienes partidas registradas.'], 404);
+        if (!$game) {
+            return response()->json(['mensaje' => 'No tienes ninguna partida activa.'], 404);
         }
 
-        return response()->json(['juegos' => $games]);
+        $game->update(['is_active' => false, 'status' => 'abandonada']);
+
+        $this->sendSlackSummary($game, 'Abandonada');
+        $this->sendTwilioMessage($user->phone, "Has abandonado la partida.");
+        return response()->json(['mensaje' => 'Has abandonado la partida.'], 200);
     }
+
+
+    // Adivinar palabra
+    public function guess(Request $request)
+    {
+        $user = Auth::user();
+
+        $data = $request->validate([
+            'word' => 'required|string|regex:/^[a-zA-Z]+$/',
+        ]);
+
+        $game = Game::where('active_player_id', $user->id)
+            ->where('is_active', true)
+            ->first();
+
+        if (!$game) {
+            return response()->json(['mensaje' => 'No tienes ninguna partida activa.'], 404);
+        }
+
+        $attempt = $data['word'];
+        $correctWord = $game->word;
+
+        if (strlen($attempt) !== strlen($correctWord)) {
+            return response()->json(['mensaje' => 'La palabra debe tener ' . strlen($correctWord) . ' letras.'], 400);
+        }
+
+        $pistas = '';
+        for ($i = 0; $i < strlen($correctWord); $i++) {
+            $pistas .= ($attempt[$i] ?? '') === $correctWord[$i] ? $correctWord[$i] : '-';
+        }
+
+        if ($attempt === $correctWord) {
+            $game->update(['is_active' => false, 'status' => 'ganada']);
+            $this->sendTwilioMessage($user->phone, "¡Felicidades! Has ganado. La palabra era: $correctWord.");
+            $this->sendSlackSummary($game, 'Ganada');
+            return response()->json(['mensaje' => '¡Felicidades! Has ganado.'], 200);
+        }
+
+        $game->decrement('remaining_attempts');
+
+        if ($game->remaining_attempts <= 0) {
+            $game->update(['is_active' => false, 'status' => 'perdida']);
+            $this->sendTwilioMessage($user->phone, "Has perdido. La palabra era: $correctWord.");
+            $this->sendSlackSummary($game, 'Perdida');
+            return response()->json(['mensaje' => 'Has perdido. La palabra era: ' . $correctWord], 200);
+        }
+
+        $this->sendTwilioMessage($user->phone, "Intento: $attempt | Pistas: $pistas | Intentos restantes: {$game->remaining_attempts}.");
+        return response()->json(['pistas' => $pistas], 200);
+    }
+
+    private function maskWordIfActive($game)
+    {
+        if (in_array($game->status, ['en progreso', 'por empezar'])) {
+            $game->word = "Secreto de Estado";
+        }
+        return $game;
+    }
+
+    private function sendSlackSummary($game, $estado)
+    {
+        SendGameSummaryToSlack::dispatch($game, $estado)->delay(now()->addMinute());
+    }
+
+    private function sendTwilioMessage($to, $message)
+    {
+        $this->twilio->messages->create("whatsapp:" . $to, [
+            'from' => 'whatsapp:' . env('TWILIO_WHATSAPP_NUMBER'),
+            'body' => $message,
+        ]);
+    }
+    
 }
