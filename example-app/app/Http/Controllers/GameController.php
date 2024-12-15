@@ -24,7 +24,7 @@ class GameController extends Controller
     {
         $user = Auth::user();
 
-        $palabra = null;
+        $palabra = "Secreto";
         $intentos = 5;
 
         while ($intentos > 0) {
