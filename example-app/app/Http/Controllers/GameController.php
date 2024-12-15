@@ -158,23 +158,24 @@ class GameController extends Controller
     }
 
     // Historial de partidas
-    public function history()
-    {
-        $user = Auth::user();
+   // Historial de partidas (solo terminadas o abandonadas)
+public function history()
+{
+    $user = Auth::user();
 
-        $games = Game::where('user_id', $user->id)
-            ->get()
-            ->map(function ($game) {
-                return $this->maskWordIfActive($game);
-            });
+    $games = Game::where('user_id', $user->id)
+        ->whereIn('status', ['ganada', 'perdida', 'abandonada']) // Filtrar solo las partidas terminadas
+        ->get()
+        ->map(function ($game) {
+            return $this->maskWordIfActive($game); // Usar la función para ocultar palabras activas
+        });
 
-        if ($games->isEmpty()) {
-            return response()->json(['mensaje' => 'No tienes partidas registradas.'], 404);
-        }
-
-        return response()->json(['historial' => $games], 200);
+    if ($games->isEmpty()) {
+        return response()->json(['mensaje' => 'No tienes partidas registradas que hayan terminado.'], 404);
     }
 
+    return response()->json(['historial' => $games], 200);
+}
     // Partida actual
     public function current()
     {
